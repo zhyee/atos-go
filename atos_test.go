@@ -36,7 +36,7 @@ func TestReadStruct(t *testing.T) {
 }
 
 func TestSymbolTable(t *testing.T) {
-	mf, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", "arm64")
+	mf, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", ArchARM64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestSymbolTable(t *testing.T) {
 
 func TestAtos(t *testing.T) {
 	//f, err := Open("testdata/AFNetworking.framework.dSYM/Contents/Resources/DWARF/AFNetworking", "arm64")
-	mf, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", "arm64")
+	mf, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", ArchARM64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestAtos(t *testing.T) {
 	mf.SetLoadAddress(0x104480000) // set ASLR slide
 	//or mf.SetLoadSlide(0x104480000 - mf.vmAddr)
 
-	symbol, err := mf.Atos(0x0000000104486ef0, false)
+	symbol, err := mf.Atos(0x0000000104486ef0 - mf.LoadSlide())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestAtos(t *testing.T) {
 
 func Test3(t *testing.T) {
 	//f, err := macho.Open("testdata/a.out.dSYM/Contents/Resources/DWARF/a.out")
-	f, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", "arm64")
+	f, err := OpenMachO("testdata/App.app.dSYM/Contents/Resources/DWARF/App", ArchARM64)
 	if err != nil {
 		t.Fatal(err)
 	}

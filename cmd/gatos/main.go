@@ -13,8 +13,7 @@ import (
 	"github.com/zhyee/atos-go"
 )
 
-const usageMsg = `
-Usage: %s [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-printHeader] [-fullPath] [-inlineFrames] [-d delimiter] [address ...]
+const usageMsg = `Usage: %s [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-printHeader] [-fullPath] [-inlineFrames] [-d delimiter] [address ...]
 
         -d/--delimiter     delimiter when outputting inline frames. Defaults to newline.
         --fullPath         show full path to source file
@@ -32,7 +31,7 @@ func showUsage() {
 }
 
 func popErrAndUsage(format string, v ...any) {
-	stderr.Println(fmt.Sprintf(format, v...))
+	stderr.Println(fmt.Sprintf(format, v...) + "\n")
 	showUsage()
 	os.Exit(1)
 }
@@ -70,7 +69,7 @@ func main() {
 	_ = flagSet.Parse(os.Args[1:])
 	addresses := flagSet.Args()
 
-	// TODO:
+	// TODO: handle inlined function
 	_ = inline
 	_ = inlineLong
 
@@ -118,8 +117,13 @@ func main() {
 		popErrAndUsage("no executable or dSYM file specified")
 	}
 
+	ac, err := atos.ParseArch(*arch)
+	if err != nil {
+		popErrAndUsage("invalid architecture [%s]: %v", *arch, err)
+	}
+
 	binaryFile := filepath.Base(*bin)
-	mf, err := atos.OpenMachO(*bin, *arch)
+	mf, err := atos.OpenMachO(*bin, ac)
 	if err != nil {
 		popErrAndUsage("unable to open the executable or dSYM file: %v", err)
 	}
@@ -137,13 +141,23 @@ func main() {
 		mf.SetLoadSlide(loadSlide)
 	}
 
+	var vmAddr uint64
 	for _, addr := range addresses {
-		hexAddr, err := strconv.ParseUint(prependHexSign(addr), 0, 64)
-		if err != nil {
-			printf("invalid address [%s]: %v\n", addr, err)
-			continue
+		if *isOffset {
+			vmAddr, err = strconv.ParseUint(addr, 0, 64)
+			if err != nil {
+				fmt.Printf("invalid address offset [%s]: %v", addr, err)
+			}
+			vmAddr += mf.VMAddr()
+		} else {
+			vmAddr, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
+			if err != nil {
+				printf("invalid address [%s]: %v\n", addr, err)
+				continue
+			}
+			vmAddr -= mf.LoadSlide()
 		}
-		symbol, err := mf.Atos(hexAddr, *isOffset)
+		symbol, err := mf.Atos(vmAddr)
 		if err != nil {
 			printf("invalid address [%s]: %v\n", addr, err)
 			continue

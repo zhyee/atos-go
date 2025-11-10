@@ -42,24 +42,39 @@ type Arch struct {
 	SubCpu uint32
 }
 
-var archSet = map[string]*Arch{
-	"i386":    {Cpu: macho.Cpu386, SubCpu: CpuSubTypeI386All},
-	"x86_64":  {Cpu: macho.CpuAmd64, SubCpu: CpuSubTypeX8664All},
-	"x86_64h": {Cpu: macho.CpuAmd64, SubCpu: CpuSubTypeX8664H},
-	"arm":     {Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmAll},
-	"armv6":   {Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV6},
-	"armv7":   {Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV7},
-	"armv7s":  {Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV7s},
-	"arm64":   {Cpu: macho.CpuArm64, SubCpu: CpuSubTypeArm64All},
-	"arm64e":  {Cpu: macho.CpuArm64, SubCpu: CpuSubTypeArm64E},
+var (
+	ArchI386   = Arch{Cpu: macho.Cpu386, SubCpu: CpuSubTypeI386All}
+	ArchX64    = Arch{Cpu: macho.CpuAmd64, SubCpu: CpuSubTypeX8664All}
+	ArchX64h   = Arch{Cpu: macho.CpuAmd64, SubCpu: CpuSubTypeX8664H}
+	ArchARM    = Arch{Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmAll}
+	ArchARMv6  = Arch{Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV6}
+	ArchARMv7  = Arch{Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV7}
+	ArchARMv7s = Arch{Cpu: macho.CpuArm, SubCpu: CpuSubTypeArmV7s}
+	ArchARM64  = Arch{Cpu: macho.CpuArm64, SubCpu: CpuSubTypeArm64All}
+	ArchARM64e = Arch{Cpu: macho.CpuArm64, SubCpu: CpuSubTypeArm64E}
+)
+
+var archSet = map[string]Arch{
+	"i386":    ArchI386,
+	"x86":     ArchI386,
+	"x86_64":  ArchX64,
+	"amd64":   ArchX64,
+	"x64":     ArchX64,
+	"x86_64h": ArchX64h,
+	"arm":     ArchARM,
+	"armv6":   ArchARMv6,
+	"armv7":   ArchARMv7,
+	"armv7s":  ArchARMv7s,
+	"arm64":   ArchARM64,
+	"arm64e":  ArchARM64e,
 }
 
-func resolveArch(arch string) (*Arch, error) {
+func ParseArch(arch string) (Arch, error) {
 	arch = strings.ToLower(strings.TrimSpace(arch))
 	if ac, ok := archSet[arch]; ok {
 		return ac, nil
 	}
-	return nil, fmt.Errorf("unsupported architecture: %s", arch)
+	return Arch{}, fmt.Errorf("unsupported architecture: %s", arch)
 }
 
 type Symbol struct {
@@ -79,17 +94,12 @@ type MachFile struct {
 	dwarfReader  *dwarf.Reader
 }
 
-func OpenMachO(file, arch string) (*MachFile, error) {
-	ac, err := resolveArch(arch)
-	if err != nil {
-		return nil, err
-	}
-
+func OpenMachO(file string, arch Arch) (*MachFile, error) {
 	f, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("unable to open file %s: %v", file, err)
 	}
-	mf, err := Parse(f, ac)
+	mf, err := Parse(f, arch)
 	if err != nil {
 		defer f.Close()
 		return nil, fmt.Errorf("unable to parse Mach-O file [%s]: %w", file, err)
@@ -118,7 +128,7 @@ func OpenMachO(file, arch string) (*MachFile, error) {
 	return mf, nil
 }
 
-func Parse(r io.ReaderAt, arch *Arch) (*MachFile, error) {
+func Parse(r io.ReaderAt, arch Arch) (*MachFile, error) {
 	magic := make([]byte, 4)
 	if _, err := r.ReadAt(magic, 0); err != nil {
 		return nil, fmt.Errorf("atosgo: unable to read Macho magic: %w", err)
@@ -159,6 +169,14 @@ func Parse(r io.ReaderAt, arch *Arch) (*MachFile, error) {
 	}
 
 	return nil, fmt.Errorf("invalid Mach-O magic: 0x%x", magicBe)
+}
+
+func (f *MachFile) VMAddr() uint64 {
+	return f.vmAddr
+}
+
+func (f *MachFile) LoadSlide() uint64 {
+	return f.loadSlide
 }
 
 func (f *MachFile) Close() error {
@@ -213,12 +231,8 @@ func (f *MachFile) SetLoadSlide(loadSlide uint64) {
 	f.loadSlide = loadSlide
 }
 
-func (f *MachFile) Atos(addr uint64, isOffset bool) (*Symbol, error) {
-	trueAddr := addr - f.loadSlide
-	if isOffset {
-		trueAddr = f.vmAddr + addr
-	}
-	entry, err := f.LocateCUEntry(trueAddr)
+func (f *MachFile) Atos(vmAddr uint64) (*Symbol, error) {
+	entry, err := f.LocateCUEntry(vmAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +244,7 @@ func (f *MachFile) Atos(addr uint64, isOffset bool) (*Symbol, error) {
 		return nil, fmt.Errorf("unable to init the line table's reader: %w", err)
 	}
 	var le dwarf.LineEntry
-	if err = lReader.SeekPC(trueAddr, &le); err != nil {
+	if err = lReader.SeekPC(vmAddr, &le); err != nil {
 		return nil, fmt.Errorf("unable to locate line entry: %w", err)
 	}
 
@@ -260,7 +274,7 @@ func (f *MachFile) Atos(addr uint64, isOffset bool) (*Symbol, error) {
 				return nil, fmt.Errorf("unable to parse subprogram ranges: %w", err)
 			}
 			for _, addrRange := range ranges {
-				if addrRange[0] <= trueAddr && addrRange[1] >= trueAddr {
+				if addrRange[0] <= vmAddr && addrRange[1] >= vmAddr {
 					funcName, _ := entry.Val(dwarf.AttrName).(string)
 					// TODO: handle inlined function
 					//inlined := entry.Val(dwarf.AttrInline)
