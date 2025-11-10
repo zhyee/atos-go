@@ -227,11 +227,16 @@ func (f *MachFile) SetLoadAddress(lAddr uint64) {
 	f.loadSlide = lAddr - f.vmAddr
 }
 
+func (f *MachFile) LoadAddress() uint64 {
+	return f.vmAddr + f.loadSlide
+}
+
 func (f *MachFile) SetLoadSlide(loadSlide uint64) {
 	f.loadSlide = loadSlide
 }
 
-func (f *MachFile) Atos(vmAddr uint64) (*Symbol, error) {
+func (f *MachFile) Atos(pc uint64) (*Symbol, error) {
+	vmAddr := pc - f.loadSlide
 	entry, err := f.LocateCUEntry(vmAddr)
 	if err != nil {
 		return nil, err

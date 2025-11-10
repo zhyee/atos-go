@@ -47,8 +47,7 @@ func main() {
 	mf.SetLoadAddress(0x104480000)
 
 	for _, addr := range []uint64{0x0000000104486ef0, 0x0000000104489940} {
-		vmAddr := addr - mf.LoadSlide()
-		symbol, err := mf.Atos(vmAddr)
+		symbol, err := mf.Atos(addr)
 		if err != nil {
 			log.Fatalf("unable to symbolize PC [0x%x]: %v", addr, err)
 		}

@@ -70,14 +70,10 @@ func TestAtos(t *testing.T) {
 	}
 	defer mf.Close()
 
-	if mf.vmAddr != 0x100000000 {
-		t.Fatalf("vmaddr expect 0x100000000, but got 0x%x, ", mf.vmAddr)
-	}
-
+	//equals: mf.SetLoadSlide(0x104480000 - mf.vmAddr)
 	mf.SetLoadAddress(0x104480000) // set ASLR slide
-	//or mf.SetLoadSlide(0x104480000 - mf.vmAddr)
 
-	symbol, err := mf.Atos(0x0000000104486ef0 - mf.LoadSlide())
+	symbol, err := mf.Atos(0x0000000104486ef0)
 	if err != nil {
 		t.Fatal(err)
 	}

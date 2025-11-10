@@ -30,6 +30,11 @@ func showUsage() {
 	stderr.Println(usage)
 }
 
+func popErr(format string, args ...interface{}) {
+	stderr.Println(fmt.Sprintf(format, args...))
+	os.Exit(1)
+}
+
 func popErrAndUsage(format string, v ...any) {
 	stderr.Println(fmt.Sprintf(format, v...) + "\n")
 	showUsage()
@@ -119,7 +124,7 @@ func main() {
 
 	ac, err := atos.ParseArch(*arch)
 	if err != nil {
-		popErrAndUsage("invalid architecture [%s]: %v", *arch, err)
+		popErr("invalid architecture [%s]: %v", *arch, err)
 	}
 
 	binaryFile := filepath.Base(*bin)
@@ -141,26 +146,23 @@ func main() {
 		mf.SetLoadSlide(loadSlide)
 	}
 
-	var vmAddr uint64
+	var pc uint64
 	for _, addr := range addresses {
 		if *isOffset {
-			vmAddr, err = strconv.ParseUint(addr, 0, 64)
+			offset, err := strconv.ParseUint(addr, 0, 64)
 			if err != nil {
-				fmt.Printf("invalid address offset [%s]: %v", addr, err)
+				popErr("invalid address offset [%s]: %v", addr, err)
 			}
-			vmAddr += mf.VMAddr()
+			pc = mf.LoadAddress() + offset
 		} else {
-			vmAddr, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
+			pc, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
 			if err != nil {
-				printf("invalid address [%s]: %v\n", addr, err)
-				continue
+				popErr("invalid address [%s]: %v\n", addr, err)
 			}
-			vmAddr -= mf.LoadSlide()
 		}
-		symbol, err := mf.Atos(vmAddr)
+		symbol, err := mf.Atos(pc)
 		if err != nil {
-			printf("invalid address [%s]: %v\n", addr, err)
-			continue
+			popErr("unable to symbolize PC [%s]: %v\n", addr, err)
 		}
 		filename := symbol.Line.File.Name
 		if !(*fullPath) {
