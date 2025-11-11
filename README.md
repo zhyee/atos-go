@@ -14,6 +14,7 @@ gatos [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddre
         --fullPath         show full path to source file
         --offset           treat all following addresses as offsets into the binary
 ```
+Issue command `gatos --help` for details.
 
 for example:
 ```shell

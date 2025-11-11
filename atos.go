@@ -8,13 +8,23 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"sort"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 const cpuArch64 = 0x01000000
+
+// Log is the internal logger, the default is a no-op one,
+// replace it with your custom *zap.SugaredLogger like below to enable it
+//
+// Log = zap.New(zapcore.NewCore(
+// zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
+// os.Stderr,
+// zapcore.DebugLevel)).Sugar()
+var Log = zap.NewNop().Sugar()
 
 // Mach-O fat-arch cpu subtype definitions, see: https://llvm.org/doxygen/BinaryFormat_2MachO_8h_source.html for details
 const (
@@ -271,7 +281,7 @@ func (f *MachFile) Atos(pc uint64) (*Symbol, error) {
 			return nil, fmt.Errorf("unable to fetch CU Subprogram entry: %w", err)
 		}
 		if entry.Tag == dwarf.TagCompileUnit || entry.Tag == dwarf.TagPartialUnit { // Got next CU or PU
-			break
+			return nil, fmt.Errorf("unable to find the target subprogram entry cause current CU has reached the end")
 		}
 		if entry.Tag == dwarf.TagSubprogram {
 			ranges, err = f.dwarf.Ranges(entry)
@@ -325,7 +335,7 @@ func (f *MachFile) FastLocateCUEntry(addr uint64) (*dwarf.Entry, error) {
 			}
 		}
 	}
-	return nil, fmt.Errorf("unable to locate CU by __debug_arrages info")
+	return nil, fmt.Errorf("unable to locate CU via __debug_arrages section cause the target PC is not in any PC ranges")
 }
 
 func (f *MachFile) LocateCUEntry(addr uint64) (*dwarf.Entry, error) {
@@ -334,7 +344,7 @@ func (f *MachFile) LocateCUEntry(addr uint64) (*dwarf.Entry, error) {
 		if err == nil {
 			return entry, nil
 		}
-		log.Printf("unable to fastly find CU entry for addr %d: %v\n", addr, err)
+		Log.Debugf("unable to seek CU for addr [0x%x] via __debug_aranges(reason: %v), try to iterate all CUs", addr, err)
 	}
 	return f.dwarfReader.SeekPC(addr)
 }
