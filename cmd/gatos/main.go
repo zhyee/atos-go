@@ -84,10 +84,12 @@ func main() {
 	}
 
 	if *debug {
-		atos.Log = zap.New(zapcore.NewCore(
-			zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
-			zapcore.AddSync(logger.Writer()),
-			zapcore.DebugLevel)).Sugar()
+		atos.SetLogger(
+			zap.New(zapcore.NewCore(
+				zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
+				zapcore.AddSync(logger.Writer()),
+				zapcore.DebugLevel)).Sugar(),
+		)
 	}
 
 	var (

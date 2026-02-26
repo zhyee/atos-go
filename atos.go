@@ -20,13 +20,14 @@ const cpuArch64 = 0x01000000
 // Log is the internal logger, the default is a no-op one,
 // replace it with your custom *zap.SugaredLogger like below to enable it
 //
-// Log = zap.New(zapcore.NewCore(
+// logger := zap.New(zapcore.NewCore(
 // zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()),
 // os.Stderr,
 // zapcore.DebugLevel)).Sugar()
+// SetLogger(logger)
 var Log = zap.NewNop().Sugar()
 
-// Mach-O fat-arch cpu subtype definitions, see: https://llvm.org/doxygen/BinaryFormat_2MachO_8h_source.html for details
+// Mach-O fat-arch cpu subtype definitions, see https://llvm.org/doxygen/BinaryFormat_2MachO_8h_source.html for details.
 const (
 	CpuSubTypeI386All  = 0x03
 	CpuSubTypeX8664All = 0x03
@@ -136,6 +137,10 @@ func OpenMachO(file string, arch Arch) (*MachFile, error) {
 	mf.dwarf = dwarfData
 	mf.dwarfReader = dwarfData.Reader()
 	return mf, nil
+}
+
+func SetLogger(l *zap.SugaredLogger) {
+	Log = l
 }
 
 func Parse(r io.ReaderAt, arch Arch) (*MachFile, error) {
