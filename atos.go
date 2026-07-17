@@ -6,10 +6,13 @@ import (
 	"debug/dwarf"
 	"debug/macho"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -118,7 +121,7 @@ func OpenMachO(file string, arch Arch) (*MachFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to open file %s: %v", file, err)
 	}
-	mf, err := Parse(f, arch)
+	mf, err := parseArch(f, arch)
 	if err != nil {
 		defer f.Close()
 		return nil, fmt.Errorf("unable to parse Mach-O file [%s]: %w", file, err)
@@ -157,7 +160,7 @@ func SetLogger(l *zap.SugaredLogger) {
 	Log = l
 }
 
-func Parse(r io.ReaderAt, arch Arch) (*MachFile, error) {
+func parseArch(r io.ReaderAt, arch Arch) (*MachFile, error) {
 	magic := make([]byte, 4)
 	if _, err := r.ReadAt(magic, 0); err != nil {
 		return nil, fmt.Errorf("atosgo: unable to read Macho magic: %w", err)
@@ -468,4 +471,41 @@ func normalizeMachOSymbolName(name string) string {
 		return name[1:]
 	}
 	return name
+}
+
+func AtosARM64(symbolFile, loadAddress string, addresses []string, fullPath bool) ([]string, error) {
+	return Atos(ArchARM64, symbolFile, loadAddress, addresses, fullPath)
+}
+
+func Atos(arch Arch, symbolFile, loadAddress string, addresses []string, fullPath bool) ([]string, error) {
+	mf, err := OpenMachO(symbolFile, arch)
+	if err != nil {
+		return nil, fmt.Errorf("parse Mach-O file: %w", err)
+	}
+	defer mf.Close()
+
+	loadAt, err := strconv.ParseUint(PrependHexSign(loadAddress), 0, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid load address [%s]: %w", loadAddress, err)
+	}
+	mf.SetLoadAddress(loadAt)
+	symbols := make([]string, 0, len(addresses))
+	binaryName := filepath.Base(symbolFile)
+	var errs []error
+	for _, addr := range addresses {
+		pc, err := strconv.ParseUint(PrependHexSign(addr), 0, 64)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("invalid address [%s]: %w", addr, err))
+			symbols = append(symbols, addr)
+			continue
+		}
+		symbol, err := mf.Atos(pc)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("unable to symbolize address [%s]: %w", addr, err))
+			symbols = append(symbols, addr)
+			continue
+		}
+		symbols = append(symbols, FormatSymbol(symbol, binaryName, fullPath))
+	}
+	return symbols, errors.Join(errs...)
 }

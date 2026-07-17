@@ -290,6 +290,16 @@ func TestAtosMany(t *testing.T) {
 	}
 }
 
+func TestAtosARM64(t *testing.T) {
+	symbols, err := AtosARM64(testDSYM, "0x104480000", []string{"0x104486ef0", "0x104486f1c"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range symbols {
+		t.Log(symbol)
+	}
+}
+
 func TestPCRangeIndexUsesHalfOpenRanges(t *testing.T) {
 	index := newPCRangeIndex([]pcRange[string]{
 		{low: 10, high: 20, value: "first"},

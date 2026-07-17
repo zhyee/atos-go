@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -46,13 +45,6 @@ func printf(format string, v ...any) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func prependHexSign(addr string) string {
-	if !strings.HasPrefix(addr, "0x") && !strings.HasPrefix(addr, "0X") {
-		addr = "0x" + addr
-	}
-	return addr
 }
 
 func main() {
@@ -105,21 +97,21 @@ func main() {
 
 	addrParams := 0
 	if *loadAddr != "" {
-		lAddr, err = strconv.ParseUint(prependHexSign(*loadAddr), 0, 64)
+		lAddr, err = strconv.ParseUint(atos.PrependHexSign(*loadAddr), 0, 64)
 		if err != nil {
 			popErrAndUsage("invalid load address: %v", err)
 		}
 		addrParams++
 	}
 	if *textExecAddress != "" {
-		kernelLoadAt, err = strconv.ParseUint(prependHexSign(*textExecAddress), 0, 64)
+		kernelLoadAt, err = strconv.ParseUint(atos.PrependHexSign(*textExecAddress), 0, 64)
 		if err != nil {
 			popErrAndUsage("invalid text exec address: %v", err)
 		}
 		addrParams++
 	}
 	if *slide != "" {
-		loadSlide, err = strconv.ParseUint(prependHexSign(*slide), 0, 64)
+		loadSlide, err = strconv.ParseUint(atos.PrependHexSign(*slide), 0, 64)
 		if err != nil {
 			popErrAndUsage("invalid slide value: %v", err)
 		}
@@ -163,18 +155,6 @@ func main() {
 	}
 	showInlineFrames := *inline || *inlineLong
 
-	printSymbol := func(symbol *atos.Symbol, terminator string) {
-		if symbol.Line == nil || symbol.Line.File == nil {
-			printf("%s (in %s) + %d%s", symbol.Func, binaryFile, symbol.Offset, terminator)
-			return
-		}
-		filename := symbol.Line.File.Name
-		if !(*fullPath) {
-			filename = path.Base(filename)
-		}
-		printf("%s (in %s) (%s:%d)%s", symbol.Func, binaryFile, filename, symbol.Line.Line, terminator)
-	}
-
 	printGroupDelimiter := func() {
 		printf("%s", *delimiter)
 		if !strings.HasSuffix(*delimiter, "\n") {
@@ -192,7 +172,7 @@ func main() {
 	symbolizeAddress := func(addr string) {
 		var pc uint64
 		if *isOffset {
-			offset, err := strconv.ParseUint(prependHexSign(addr), 0, 64)
+			offset, err := strconv.ParseUint(atos.PrependHexSign(addr), 0, 64)
 			if err != nil {
 				atos.Log.Debugf("invalid address offset [%s]: %v", addr, err)
 				printUnresolved(addr)
@@ -210,7 +190,7 @@ func main() {
 			}
 			pc = loadAddress + offset
 		} else {
-			pc, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
+			pc, err = strconv.ParseUint(atos.PrependHexSign(addr), 0, 64)
 			if err != nil {
 				atos.Log.Debugf("invalid address [%s]: %v", addr, err)
 				printUnresolved(addr)
@@ -238,7 +218,7 @@ func main() {
 			return
 		}
 		for _, symbol := range symbols {
-			printSymbol(symbol, "\n")
+			printf("%s%s", atos.FormatSymbol(symbol, binaryFile, *fullPath), "\n")
 		}
 		if showInlineFrames {
 			printGroupDelimiter()

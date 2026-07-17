@@ -3,6 +3,8 @@ package atos
 import (
 	"fmt"
 	"io"
+	"path"
+	"strings"
 )
 
 type bytesReader struct {
@@ -79,4 +81,22 @@ func (r *bytesReader) Seek(offset int64, whence int) (int64, error) {
 	}
 	r.offset = int(newOff)
 	return newOff, nil
+}
+
+func PrependHexSign(addr string) string {
+	if !strings.HasPrefix(addr, "0x") && !strings.HasPrefix(addr, "0X") {
+		addr = "0x" + addr
+	}
+	return addr
+}
+
+func FormatSymbol(symbol *Symbol, moduleName string, fullPath bool) string {
+	if symbol.Line == nil || symbol.Line.File == nil {
+		return fmt.Sprintf("%s (in %s) + %d", symbol.Func, moduleName, symbol.Offset)
+	}
+	filename := symbol.Line.File.Name
+	if !fullPath {
+		filename = path.Base(filename)
+	}
+	return fmt.Sprintf("%s (in %s) (%s:%d)", symbol.Func, moduleName, filename, symbol.Line.Line)
 }
