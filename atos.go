@@ -90,7 +90,15 @@ func ParseArch(arch string) (Arch, error) {
 
 type Symbol struct {
 	Func string
+	// Offset is the byte offset from the beginning of Func.
+	Offset uint64
+	// Line is nil when the binary has no line table entry for the address.
 	Line *dwarf.LineEntry
+}
+
+type SymbolicationResult struct {
+	Symbol *Symbol
+	Err    error
 }
 
 type MachFile struct {
@@ -102,7 +110,7 @@ type MachFile struct {
 	debugAranges []*DwarfArange
 	symbolTable  []*macho.Symbol
 	dwarf        *dwarf.Data
-	dwarfReader  *dwarf.Reader
+	dwarfIndex   dwarfIndexState
 }
 
 func OpenMachO(file string, arch Arch) (*MachFile, error) {
@@ -115,27 +123,33 @@ func OpenMachO(file string, arch Arch) (*MachFile, error) {
 		defer f.Close()
 		return nil, fmt.Errorf("unable to parse Mach-O file [%s]: %w", file, err)
 	}
-	_ = mf.parseDebugAranges()
 	for _, load := range mf.Loads {
 		if s, ok := load.(*macho.Segment); ok && s.Name == "__TEXT" {
 			mf.vmAddr = s.Addr // parse __TEXT vmaddr
 			break
 		}
 	}
-	mf.symbolTable = make([]*macho.Symbol, len(mf.Symtab.Syms))
-	for i := range mf.Symtab.Syms {
-		mf.symbolTable[i] = &mf.Symtab.Syms[i]
+	if mf.Symtab != nil {
+		for i := range mf.Symtab.Syms {
+			symbol := &mf.Symtab.Syms[i]
+			if mf.isTextSymbol(symbol) {
+				mf.symbolTable = append(mf.symbolTable, symbol)
+			}
+		}
 	}
-	sort.Slice(mf.symbolTable, func(i, j int) bool {
-		return mf.symbolTable[i].Value >= mf.symbolTable[j].Value // descending sort
+	sort.SliceStable(mf.symbolTable, func(i, j int) bool {
+		return mf.symbolTable[i].Value > mf.symbolTable[j].Value // descending sort
 	})
 	dwarfData, err := mf.DWARF()
 	if err != nil {
-		_ = mf.Close()
-		return nil, fmt.Errorf("unable to parse DWARF debug info: %w", err)
+		if len(mf.symbolTable) == 0 {
+			_ = mf.Close()
+			return nil, fmt.Errorf("unable to parse DWARF debug info: %w", err)
+		}
+		Log.Debugf("unable to parse DWARF debug info, falling back to the symbol table: %v", err)
+		return mf, nil
 	}
 	mf.dwarf = dwarfData
-	mf.dwarfReader = dwarfData.Reader()
 	return mf, nil
 }
 
@@ -223,7 +237,7 @@ func (f *MachFile) parseDebugAranges() error {
 			if err != nil {
 				return err
 			}
-			aranges, err := ParseDebugAranges(newBytesReader(b))
+			aranges, err := ParseDebugAranges(newBytesReader(b), f.ByteOrder)
 			if err != nil {
 				return fmt.Errorf("unable to parse _debug_aranges: %w", err)
 			}
@@ -231,9 +245,7 @@ func (f *MachFile) parseDebugAranges() error {
 		}
 	}
 	if len(f.debugAranges) > 0 {
-		sort.Slice(f.debugAranges, func(i, j int) bool {
-			return f.debugAranges[i].LowPC < f.debugAranges[j].LowPC
-		})
+		sortDwarfAranges(f.debugAranges)
 	}
 	return nil
 }
@@ -250,125 +262,162 @@ func (f *MachFile) SetLoadSlide(loadSlide uint64) {
 	f.loadSlide = loadSlide
 }
 
+func (f *MachFile) UnslideAddress(pc uint64) (uint64, error) {
+	if pc < f.loadSlide {
+		return 0, fmt.Errorf("PC 0x%x is below load slide 0x%x", pc, f.loadSlide)
+	}
+	return pc - f.loadSlide, nil
+}
+
+func (f *MachFile) ContainsVMAddress(addr uint64) bool {
+	for _, load := range f.Loads {
+		if segment, ok := load.(*macho.Segment); ok && containsAddress(segment.Addr, segment.Memsz, addr) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *MachFile) Atos(pc uint64) (*Symbol, error) {
-	vmAddr := pc - f.loadSlide
-	entry, err := f.LocateCUEntry(vmAddr)
+	frames, err := f.symbolicateFrames(pc, false)
 	if err != nil {
 		return nil, err
 	}
-	if entry.Tag != dwarf.TagCompileUnit {
-		return nil, fmt.Errorf("expect a compile unit entry but got %s", entry.Tag.String())
-	}
-	lReader, err := f.dwarf.LineReader(entry)
+	return frames[len(frames)-1], nil
+}
+
+// AtosInlineFrames symbolizes PC and returns inline frames from the innermost
+// inlined call to the concrete outer function, matching atos -inlineFrames.
+func (f *MachFile) AtosInlineFrames(pc uint64) ([]*Symbol, error) {
+	return f.symbolicateFrames(pc, true)
+}
+
+func (f *MachFile) symbolicateFrames(pc uint64, includeInlineFrames bool) ([]*Symbol, error) {
+	vmAddr, err := f.UnslideAddress(pc)
 	if err != nil {
-		return nil, fmt.Errorf("unable to init the line table's reader: %w", err)
-	}
-	var le dwarf.LineEntry
-	if err = lReader.SeekPC(vmAddr, &le); err != nil {
-		return nil, fmt.Errorf("unable to locate line entry: %w", err)
+		return nil, err
 	}
 
-	//name, err := f.ResolveNameFromSymTab(trueAddr)
-	//if err == nil {
-	//	return &Symbol{
-	//		Func: name,
-	//		Line: &le,
-	//	}, nil
-	//}
-
-	var ranges [][2]uint64
-	for {
-		entry, err = f.dwarfReader.Next()
-		if entry == nil && err == nil {
-			break // EOF
-		}
-		if err != nil {
-			return nil, fmt.Errorf("unable to fetch CU Subprogram entry: %w", err)
-		}
-		if entry.Tag == dwarf.TagCompileUnit || entry.Tag == dwarf.TagPartialUnit { // Got next CU or PU
-			return nil, fmt.Errorf("unable to find the target subprogram entry cause current CU has reached the end")
-		}
-		if entry.Tag == dwarf.TagSubprogram {
-			ranges, err = f.dwarf.Ranges(entry)
-			if err != nil {
-				return nil, fmt.Errorf("unable to parse subprogram ranges: %w", err)
+	var (
+		funcName  string
+		funcLowPC uint64
+		line      *dwarf.LineEntry
+		cu        *compileUnitIndex
+		dwarfErr  error
+	)
+	index, err := f.dwarfIndex.get(f.dwarf)
+	if err != nil {
+		dwarfErr = err
+	} else if compileUnit, ok := index.compileUnits.find(vmAddr); ok {
+		cu = compileUnit
+		if err := cu.ensure(f.dwarf); err != nil {
+			dwarfErr = err
+		} else {
+			if function, ok := cu.functions.find(vmAddr); ok {
+				funcName = displayFunctionName(function.names.linkage, function.names.fallback)
+				funcLowPC = function.lowPC
 			}
-			for _, addrRange := range ranges {
-				if addrRange[0] <= vmAddr && addrRange[1] >= vmAddr {
-					funcName, _ := entry.Val(dwarf.AttrName).(string)
-					// TODO: handle inlined function
-					//inlined := entry.Val(dwarf.AttrInline)
-					return &Symbol{
-						Func: funcName,
-						Line: &le,
-					}, nil
+			if lineEntry, ok := cu.lines.find(vmAddr); ok {
+				line = &lineEntry
+			}
+		}
+	}
+
+	var frames []*Symbol
+	outerLine := line
+	if cu != nil && dwarfErr == nil {
+		if inline, ok := cu.findInline(vmAddr); ok {
+			currentLine := cloneLineEntry(line)
+			for current := inline; current != nil; current = current.parent {
+				if includeInlineFrames {
+					name := displayFunctionName(current.names.linkage, current.names.fallback)
+					if name != "" {
+						frames = append(frames, &Symbol{Func: name, Line: currentLine})
+					}
 				}
+				currentLine = cu.callSiteLine(current, vmAddr)
 			}
+			outerLine = currentLine
 		}
 	}
 
-	return nil, fmt.Errorf("unable to find subprogram entry")
+	if funcName == "" {
+		if symbol, err := f.resolveSymbolFromSymTab(vmAddr); err == nil {
+			funcName = displayFunctionName(normalizeMachOSymbolName(symbol.Name), "")
+			funcLowPC = symbol.Value
+		}
+	}
+	if funcName == "" {
+		if len(frames) > 0 {
+			return frames, nil
+		}
+		if dwarfErr != nil {
+			return nil, fmt.Errorf("unable to symbolize PC 0x%x: %w", pc, dwarfErr)
+		}
+		return nil, fmt.Errorf("unable to find subprogram entry for PC 0x%x", pc)
+	}
+
+	frames = append(frames, &Symbol{Func: funcName, Offset: vmAddr - funcLowPC, Line: outerLine})
+	return frames, nil
+}
+
+func cloneLineEntry(line *dwarf.LineEntry) *dwarf.LineEntry {
+	if line == nil {
+		return nil
+	}
+	cloned := *line
+	return &cloned
+}
+
+// AtosMany symbolizes PCs in input order. Each result carries its own error so
+// one unknown address does not discard successful symbolications.
+func (f *MachFile) AtosMany(pcs []uint64) []SymbolicationResult {
+	results := make([]SymbolicationResult, len(pcs))
+	for i, pc := range pcs {
+		results[i].Symbol, results[i].Err = f.Atos(pc)
+	}
+	return results
 }
 
 func (f *MachFile) FastLocateCUEntry(addr uint64) (*dwarf.Entry, error) {
-	if len(f.debugAranges) == 0 {
-		return nil, fmt.Errorf("no debug aranges available")
+	index, err := f.dwarfIndex.get(f.dwarf)
+	if err != nil {
+		return nil, err
 	}
-	idx, found := sort.Find(len(f.debugAranges), func(i int) int {
-		if f.debugAranges[i].LowPC <= addr && f.debugAranges[i].HighPC >= addr {
-			return 0
-		}
-		if f.debugAranges[i].LowPC > addr {
-			return -1
-		}
-		return 1
-	})
-	if found {
-		cuHeaderOff := f.debugAranges[idx].CUOffset
-		for _, section := range f.Sections {
-			if section.Name == "__debug_info" || section.Name == "__zdebug_info" {
-				secData, err := sectionData(section)
-				if err != nil {
-					return nil, fmt.Errorf("unable to parse __debug_info in DWARF: %w", err)
-				}
-				cuBodyOff, err := GetCUBodyOffset(cuHeaderOff, newBytesReader(secData))
-				if err != nil {
-					return nil, fmt.Errorf("unable to locate CU by CU offset: %w", err)
-				}
-				f.dwarfReader.Seek(dwarf.Offset(cuBodyOff))
-				return f.dwarfReader.Next()
-			}
-		}
+	if cu, ok := index.compileUnits.find(addr); ok {
+		return cu.entry, nil
 	}
-	return nil, fmt.Errorf("unable to locate CU via __debug_arrages section cause the target PC is not in any PC ranges")
+	return nil, fmt.Errorf("no compile unit entry for address 0x%x", addr)
 }
 
 func (f *MachFile) LocateCUEntry(addr uint64) (*dwarf.Entry, error) {
-	if len(f.debugAranges) > 0 {
-		entry, err := f.FastLocateCUEntry(addr)
-		if err == nil {
-			return entry, nil
-		}
-		Log.Debugf("unable to seek CU for addr [0x%x] via __debug_aranges(reason: %v), try to iterate all CUs", addr, err)
-	}
-	return f.dwarfReader.SeekPC(addr)
+	return f.FastLocateCUEntry(addr)
 }
 
 func (f *MachFile) ResolveNameFromSymTab(addr uint64) (string, error) {
+	symbol, err := f.resolveSymbolFromSymTab(addr)
+	if err != nil {
+		return "", err
+	}
+	return symbol.Name, nil
+}
+
+func (f *MachFile) resolveSymbolFromSymTab(addr uint64) (*macho.Symbol, error) {
 	idx := sort.Search(len(f.symbolTable), func(i int) bool {
 		return f.symbolTable[i].Value <= addr
 	})
 	if idx >= len(f.symbolTable) {
-		return "", fmt.Errorf("no symbol table entry for addr 0x%x", addr)
+		return nil, fmt.Errorf("no symbol table entry for addr 0x%x", addr)
 	}
 	symbol := f.symbolTable[idx]
-	if f.Sections[symbol.Sect-1].Seg != "__TEXT" || f.Sections[symbol.Sect-1].Name != "__text" {
-		return "", fmt.Errorf("symbol table entry for addr 0x%x is not in __TEXT,__text section", addr)
+	if !f.isTextSymbol(symbol) {
+		return nil, fmt.Errorf("symbol table entry for addr 0x%x is not in __TEXT,__text", addr)
 	}
-	if symbol.Type&0x0e != 0x0e {
-		return "", fmt.Errorf("symbol table entry for addr 0x%x is not N_SECT type", addr)
+	section, ok := f.textSectionForSymbol(symbol)
+	if !ok || !containsAddress(section.Addr, section.Size, addr) {
+		return nil, fmt.Errorf("symbol table entry for addr 0x%x is not in __TEXT,__text", addr)
 	}
-	return symbol.Name, nil
+	return symbol, nil
 }
 
 func sectionData(s *macho.Section) ([]byte, error) {
@@ -391,4 +440,32 @@ func sectionData(s *macho.Section) ([]byte, error) {
 		b = secData
 	}
 	return b, nil
+}
+
+func (f *MachFile) isTextSymbol(symbol *macho.Symbol) bool {
+	section, ok := f.textSectionForSymbol(symbol)
+	return ok && containsAddress(section.Addr, section.Size, symbol.Value)
+}
+
+func (f *MachFile) textSectionForSymbol(symbol *macho.Symbol) (*macho.Section, bool) {
+	if symbol == nil || symbol.Type&0xe0 != 0 || symbol.Type&0x0e != 0x0e {
+		return nil, false
+	}
+	sectionIndex := int(symbol.Sect) - 1
+	if sectionIndex < 0 || sectionIndex >= len(f.Sections) {
+		return nil, false
+	}
+	section := f.Sections[sectionIndex]
+	return section, section.Seg == "__TEXT" && section.Name == "__text"
+}
+
+func containsAddress(start, size, addr uint64) bool {
+	return addr >= start && addr-start < size
+}
+
+func normalizeMachOSymbolName(name string) string {
+	if strings.HasPrefix(name, "_") {
+		return name[1:]
+	}
+	return name
 }

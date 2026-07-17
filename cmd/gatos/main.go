@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"debug/macho"
 	"flag"
 	"fmt"
 	"log"
@@ -15,7 +17,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-const usageMsg = `Usage: %s [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-printHeader] [-fullPath] [-inlineFrames] [-d delimiter] [address ...]`
+const usageMsg = `Usage: %s [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-fullPath] [-inlineFrames] [-d delimiter] [address ...]`
 
 var (
 	usage   = fmt.Sprintf(usageMsg, os.Args[0]) + "\n"
@@ -61,26 +63,30 @@ func main() {
 	debug := flagSet.Bool("debug", false, "enable debug logging")
 	helpLong := flagSet.Bool("help", false, "show this help")
 	bin := flagSet.String("o", "", `The path to a binary image file or dSYM in which to look up symbols`)
+	inputFile := flagSet.String("f", "", `Path to a file containing whitespace-separated input addresses`)
 	arch := flagSet.String("arch", "arm64", `The particular architecture of a binary image file in which to look up symbols`)
 	loadAddr := flagSet.String("l", "", `The load address of the binary image.  This value is always assumed to be in hex, even without a "0x" prefix.  The input addresses are assumed to be in a binary image with that load address.  Load addresses for binary images can be found in the Binary Images: section at the bottom of crash, sample, leaks, and malloc_history reports`)
-	textExecAddress := flag.String("textExecAddress", "", `Should be used instead of load address with kernel-space binary images on arm64(e) devices.  This value is always assumed to be in hex, even without a "0x" prefix.
+	textExecAddress := flagSet.String("textExecAddress", "", `Should be used instead of load address with kernel-space binary images on arm64(e) devices.  This value is always assumed to be in hex, even without a "0x" prefix.
              The input addresses are assumed to be in a binary image with that text exec address. In kernel panic report the text exec address can be found in "Kernel text exec base" line, or for kexts in "Kernel Extensions in backtrace:" section. This value is always assumed to be in hex, even without a "0x" prefix`)
 	slide := flagSet.String("s", "", `The slide value of the binary image -- this is the difference between the load address of a binary image, and the address at which the binary image was built.  This slide value is subtracted from the input addresses.  It is usually easier to directly specify the load address with the -l argument than to manually calculate a slide value. This value is always assumed to be in hex, even without a "0x" prefix`)
 	isOffset := flagSet.Bool("offset", false, `Treat all given addresses as offsets into the binary. Only one of the following options can be used at a time: -s , -l , -textExecAddress or -offset`)
 	fullPath := flagSet.Bool("fullPath", false, `Print the full path of the source files`)
-	inline := flagSet.Bool("i", false, `Display inlined symbols, not yet implemented`)
-	inlineLong := flagSet.Bool("inlineFrames", false, `Display inlined symbols, not yet implemented`)
+	inline := flagSet.Bool("i", false, `Display inlined symbols`)
+	inlineLong := flagSet.Bool("inlineFrames", false, `Display inlined symbols`)
 	delimiter := flagSet.String("d", "\n", `Delimiter when outputting inline frames. Defaults to newline`)
 	_ = flagSet.Parse(os.Args[1:])
-	addresses := flagSet.Args()
-
-	// TODO: show inlined function
-	_ = inline
-	_ = inlineLong
+	addresses := append([]string(nil), flagSet.Args()...)
 
 	if *help || *helpLong {
 		showUsage()
 		return
+	}
+	if *inputFile != "" {
+		fileAddresses, err := readAddressFile(*inputFile)
+		if err != nil {
+			popErr("unable to read address input file: %v", err)
+		}
+		addresses = append(fileAddresses, addresses...)
 	}
 
 	if *debug {
@@ -155,35 +161,116 @@ func main() {
 	if loadSlide > 0 {
 		mf.SetLoadSlide(loadSlide)
 	}
+	showInlineFrames := *inline || *inlineLong
 
-	var pc uint64
-	for _, addr := range addresses {
-		if *isOffset {
-			offset, err := strconv.ParseUint(prependHexSign(addr), 0, 64)
-			if err != nil {
-				atos.Log.Debugf("invalid address offset [%s]: %v", addr, err)
-				fmt.Printf("%s%s", addr, *delimiter)
-				continue
-			}
-			pc = mf.LoadAddress() + offset
-		} else {
-			pc, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
-			if err != nil {
-				atos.Log.Debugf("invalid address [%s]: %v", addr, err)
-				fmt.Printf("%s%s", addr, *delimiter)
-				continue
-			}
-		}
-		symbol, err := mf.Atos(pc)
-		if err != nil {
-			atos.Log.Debugf("unable to symbolize PC [%s]: %v", addr, err)
-			fmt.Printf("%s%s", addr, *delimiter)
-			continue
+	printSymbol := func(symbol *atos.Symbol, terminator string) {
+		if symbol.Line == nil || symbol.Line.File == nil {
+			printf("%s (in %s) + %d%s", symbol.Func, binaryFile, symbol.Offset, terminator)
+			return
 		}
 		filename := symbol.Line.File.Name
 		if !(*fullPath) {
 			filename = path.Base(filename)
 		}
-		printf("%s (in %s) (%s:%d)%s", symbol.Func, binaryFile, filename, symbol.Line.Line, *delimiter)
+		printf("%s (in %s) (%s:%d)%s", symbol.Func, binaryFile, filename, symbol.Line.Line, terminator)
 	}
+
+	printGroupDelimiter := func() {
+		printf("%s", *delimiter)
+		if !strings.HasSuffix(*delimiter, "\n") {
+			printf("\n")
+		}
+	}
+
+	printUnresolved := func(value string) {
+		printf("%s\n", value)
+		if showInlineFrames {
+			printGroupDelimiter()
+		}
+	}
+
+	symbolizeAddress := func(addr string) {
+		var pc uint64
+		if *isOffset {
+			offset, err := strconv.ParseUint(prependHexSign(addr), 0, 64)
+			if err != nil {
+				atos.Log.Debugf("invalid address offset [%s]: %v", addr, err)
+				printUnresolved(addr)
+				return
+			}
+			if offset == 0 {
+				printUnresolved(addr)
+				return
+			}
+			loadAddress := mf.LoadAddress()
+			if offset > ^uint64(0)-loadAddress {
+				atos.Log.Debugf("address offset [%s] overflows the image load address", addr)
+				printUnresolved(addr)
+				return
+			}
+			pc = loadAddress + offset
+		} else {
+			pc, err = strconv.ParseUint(prependHexSign(addr), 0, 64)
+			if err != nil {
+				atos.Log.Debugf("invalid address [%s]: %v", addr, err)
+				printUnresolved(addr)
+				return
+			}
+		}
+
+		var symbols []*atos.Symbol
+		if showInlineFrames {
+			symbols, err = mf.AtosInlineFrames(pc)
+		} else {
+			var symbol *atos.Symbol
+			symbol, err = mf.Atos(pc)
+			if err == nil {
+				symbols = []*atos.Symbol{symbol}
+			}
+		}
+		if err != nil {
+			atos.Log.Debugf("unable to symbolize PC [%s]: %v", addr, err)
+			if vmAddr, unslideErr := mf.UnslideAddress(pc); unslideErr == nil && mf.ContainsVMAddress(vmAddr) {
+				printUnresolved(fmt.Sprintf("%s (in %s)", formatVMAddress(mf, vmAddr), binaryFile))
+				return
+			}
+			printUnresolved(addr)
+			return
+		}
+		for _, symbol := range symbols {
+			printSymbol(symbol, "\n")
+		}
+		if showInlineFrames {
+			printGroupDelimiter()
+		}
+	}
+
+	for _, addr := range addresses {
+		symbolizeAddress(addr)
+	}
+	if len(addresses) == 0 && *inputFile == "" {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Split(bufio.ScanWords)
+		for scanner.Scan() {
+			symbolizeAddress(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			popErr("unable to read addresses from stdin: %v", err)
+		}
+	}
+}
+
+func formatVMAddress(mf *atos.MachFile, addr uint64) string {
+	if mf.Magic == macho.Magic64 {
+		return fmt.Sprintf("0x%016x", addr)
+	}
+	return fmt.Sprintf("0x%08x", addr)
+}
+
+func readAddressFile(file string) ([]string, error) {
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(contents)), nil
 }

@@ -8,13 +8,15 @@ go install github.com/zhyee/atos-go/cmd/gatos@latest
 
 # Usage
 ```text
-gatos [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-printHeader] [-fullPath] [-d delimiter] [address ...]
+gatos [-o executable/dSYM] [-f file-of-input-addresses] [-s slide | -l loadAddress | -textExecAddress addr | -offset] [-arch architecture] [-i | -inlineFrames] [-fullPath] [-d delimiter] [address ...]
 
         -d/--delimiter     delimiter when outputting inline frames. Defaults to newline.
+        -f                 read whitespace-separated addresses from a file
+        -i/--inlineFrames  display inlined function frames
         --fullPath         show full path to source file
         --offset           treat all following addresses as offsets into the binary
 ```
-Issue command `gatos --help` for details.
+Type command `gatos --help` for details.
 
 for example:
 ```shell
@@ -52,6 +54,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("unable to symbolize PC [0x%x]: %v", addr, err)
 		}
+		if symbol.Line == nil || symbol.Line.File == nil {
+			log.Printf("addr: 0x%x, func: %s", addr, symbol.Func)
+			continue
+		}
 		log.Printf("addr: 0x%x, func: %s, file: %s, line: %d",
 			addr, symbol.Func, symbol.Line.File.Name, symbol.Line.Line)
 	}
@@ -59,5 +65,4 @@ func main() {
 ```
 
 # Todo
-- Resolve inlined function.
 - Add parsing cache support.

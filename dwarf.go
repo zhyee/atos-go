@@ -2,7 +2,6 @@ package atos
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -15,132 +14,147 @@ type DwarfArange struct {
 	HighPC          uint64
 }
 
-func ParseDebugAranges(br *bytesReader) ([]*DwarfArange, error) {
-	if br.Len() < 6 {
-		return nil, errors.New("a DWARF CU is at least 6 bytes long")
+func ParseDebugAranges(br *bytesReader, byteOrders ...binary.ByteOrder) ([]*DwarfArange, error) {
+	if br == nil {
+		return nil, fmt.Errorf("unable to parse a nil __debug_aranges reader")
+	}
+	if len(byteOrders) > 1 {
+		return nil, fmt.Errorf("expected at most one byte order, got %d", len(byteOrders))
 	}
 
-	var (
-		aranges             []*DwarfArange
-		isDWARF64           bool
-		byteOrder           binary.ByteOrder
-		bodyLength          uint64
-		version             uint16
-		debugInfoOffset     uint64
-		addressSize         int
-		segmentSelectorSize int
-	)
+	var byteOrder binary.ByteOrder
+	if len(byteOrders) == 1 {
+		byteOrder = byteOrders[0]
+		if byteOrder == nil {
+			return nil, fmt.Errorf("unable to parse __debug_aranges with a nil byte order")
+		}
+	}
 
+	var aranges []*DwarfArange
 	for br.Len() > 0 {
-		startOffset := br.Offset()
-		isDWARF64 = false
-
-		unitLen, err := br.Bytes(4)
-		if err != nil {
-			return aranges, err
+		setStart := br.Offset()
+		if br.Len() < 4 {
+			return aranges, fmt.Errorf("truncated __debug_aranges initial length at offset 0x%x", setStart)
 		}
-
-		if unitLen[0] == 0xff && unitLen[1] == 0xff && unitLen[2] == 0xff && unitLen[3] == 0xff {
-			isDWARF64 = true
-			unitLen, err = br.Bytes(8)
+		if byteOrder == nil {
+			var err error
+			byteOrder, err = inferArangesByteOrder(br.data, setStart)
 			if err != nil {
 				return aranges, err
 			}
 		}
 
-		versionBytes, err := br.Bytes(2) // 2 bytes version
+		initialLengthBytes, _ := br.Bytes(4)
+		initialLength := byteOrder.Uint32(initialLengthBytes)
+		lengthFieldSize := 4
+		offsetSize := 4
+		var unitLength uint64
+		switch {
+		case initialLength == 0xffffffff:
+			lengthFieldSize = 12
+			offsetSize = 8
+			lengthBytes, err := readArangesBytes(br, 8, len(br.data))
+			if err != nil {
+				return aranges, fmt.Errorf("truncated DWARF64 initial length at offset 0x%x: %w", setStart, err)
+			}
+			unitLength = byteOrder.Uint64(lengthBytes)
+		case initialLength >= 0xfffffff0:
+			return aranges, fmt.Errorf("reserved DWARF initial length 0x%x at offset 0x%x", initialLength, setStart)
+		default:
+			unitLength = uint64(initialLength)
+		}
+		if unitLength == 0 {
+			return aranges, fmt.Errorf("zero-length address range table at offset 0x%x", setStart)
+		}
+
+		contentStart := br.Offset()
+		if unitLength > uint64(len(br.data)-contentStart) {
+			return aranges, fmt.Errorf(
+				"address range table at offset 0x%x has length 0x%x exceeding the remaining section size 0x%x",
+				setStart, unitLength, len(br.data)-contentStart,
+			)
+		}
+		setEnd := contentStart + int(unitLength)
+
+		versionBytes, err := readArangesBytes(br, 2, setEnd)
 		if err != nil {
-			return aranges, err
+			return aranges, fmt.Errorf("unable to read address range version at offset 0x%x: %w", setStart, err)
 		}
-		if versionBytes[0] > 0 {
-			byteOrder = binary.LittleEndian
-		} else {
-			byteOrder = binary.BigEndian
-		}
-
-		if isDWARF64 {
-			bodyLength = byteOrder.Uint64(unitLen)
-		} else {
-			bodyLength = uint64(byteOrder.Uint32(unitLen))
-		}
-
-		if bodyLength == 0 {
-			continue // current unit is finish
-		}
-
-		version = byteOrder.Uint16(versionBytes)
+		version := byteOrder.Uint16(versionBytes)
 		if version != 2 {
-			return aranges, fmt.Errorf("only support DWARF __debug_aranges version 2 now, but got %d", version)
+			return aranges, fmt.Errorf("unsupported __debug_aranges version %d at offset 0x%x", version, setStart)
 		}
 
-		if isDWARF64 {
-			debugOff, err := br.Bytes(8)
-			if err != nil {
-				return aranges, err
-			}
-			debugInfoOffset = byteOrder.Uint64(debugOff)
-		} else {
-			debugOff, err := br.Bytes(4)
-			if err != nil {
-				return aranges, err
-			}
-			debugInfoOffset = uint64(byteOrder.Uint32(debugOff))
-		}
-		addSize, err := br.ReadByte()
+		debugInfoOffset, err := readArangesUint(br, offsetSize, byteOrder, setEnd)
 		if err != nil {
-			return aranges, err
+			return aranges, fmt.Errorf("unable to read debug_info offset at 0x%x: %w", setStart, err)
 		}
-		addressSize = int(addSize)
-
-		selectorSize, err := br.ReadByte()
+		addressSizeByte, err := readArangesBytes(br, 1, setEnd)
 		if err != nil {
-			return aranges, err
+			return aranges, fmt.Errorf("unable to read address size at 0x%x: %w", setStart, err)
 		}
-		segmentSelectorSize = int(selectorSize)
-
-		tupleSize := segmentSelectorSize + addressSize*2
-
-		// padding to multi of tupleSize
-		if remain := (br.Offset() - startOffset) % tupleSize; remain != 0 {
-			if _, err = br.Skip(tupleSize - remain); err != nil {
-				return aranges, err
-			}
+		segmentSizeByte, err := readArangesBytes(br, 1, setEnd)
+		if err != nil {
+			return aranges, fmt.Errorf("unable to read segment selector size at 0x%x: %w", setStart, err)
+		}
+		addressSize := int(addressSizeByte[0])
+		segmentSize := int(segmentSizeByte[0])
+		if !supportedArangesUintSize(addressSize, false) {
+			return aranges, fmt.Errorf("unsupported address size %d at offset 0x%x", addressSize, setStart)
+		}
+		if !supportedArangesUintSize(segmentSize, true) {
+			return aranges, fmt.Errorf("unsupported segment selector size %d at offset 0x%x", segmentSize, setStart)
 		}
 
-		for {
-			var segment, address, length uint64
-			if segmentSelectorSize > 0 {
-				ss, err := br.Bytes(segmentSelectorSize)
-				if err != nil {
-					return aranges, err
-				}
-				switch segmentSelectorSize {
-				case 1:
-					segment = uint64(ss[0])
-				case 2:
-					segment = uint64(byteOrder.Uint16(ss))
-				case 4:
-					segment = uint64(byteOrder.Uint32(ss))
-				case 8:
-					segment = byteOrder.Uint64(ss)
-				}
-			}
-			addr, err := br.Bytes(addressSize * 2)
+		tupleSize := segmentSize + addressSize*2
+		fullLength := lengthFieldSize + int(unitLength)
+		if fullLength%tupleSize != 0 {
+			return aranges, fmt.Errorf(
+				"address range table at offset 0x%x has size 0x%x not aligned to tuple size 0x%x",
+				setStart, fullLength, tupleSize,
+			)
+		}
+		headerSize := br.Offset() - setStart
+		padding := (tupleSize - headerSize%tupleSize) % tupleSize
+		if padding > setEnd-br.Offset() {
+			return aranges, fmt.Errorf("address range table at offset 0x%x is too short for header padding", setStart)
+		}
+		if _, err := br.Skip(padding); err != nil {
+			return aranges, fmt.Errorf("unable to skip address range header padding at 0x%x: %w", setStart, err)
+		}
+		if setEnd-br.Offset() < tupleSize {
+			return aranges, fmt.Errorf("address range table at offset 0x%x has no room for a terminating tuple", setStart)
+		}
+
+		terminated := false
+		for br.Offset() < setEnd {
+			entryOffset := br.Offset()
+			segment, err := readArangesUint(br, segmentSize, byteOrder, setEnd)
 			if err != nil {
-				return aranges, err
+				return aranges, fmt.Errorf("unable to read segment selector at 0x%x: %w", entryOffset, err)
 			}
-			if addressSize == 4 {
-				address = uint64(byteOrder.Uint32(addr[:4]))
-				length = uint64(byteOrder.Uint32(addr[4:]))
-			} else {
-				address = byteOrder.Uint64(addr[:8])
-				length = byteOrder.Uint64(addr[8:])
+			address, err := readArangesUint(br, addressSize, byteOrder, setEnd)
+			if err != nil {
+				return aranges, fmt.Errorf("unable to read range address at 0x%x: %w", entryOffset, err)
+			}
+			length, err := readArangesUint(br, addressSize, byteOrder, setEnd)
+			if err != nil {
+				return aranges, fmt.Errorf("unable to read range length at 0x%x: %w", entryOffset, err)
 			}
 
 			if segment == 0 && address == 0 && length == 0 {
-				break // mark current CU is ended
+				if br.Offset() != setEnd {
+					return aranges, fmt.Errorf("premature terminating tuple at offset 0x%x", entryOffset)
+				}
+				terminated = true
+				break
 			}
-
+			if length == 0 {
+				return aranges, fmt.Errorf("zero-length address range at offset 0x%x", entryOffset)
+			}
+			if address > ^uint64(0)-length {
+				return aranges, fmt.Errorf("address range overflows at offset 0x%x", entryOffset)
+			}
 			aranges = append(aranges, &DwarfArange{
 				CUOffset:        debugInfoOffset,
 				SegmentSelector: segment,
@@ -148,13 +162,97 @@ func ParseDebugAranges(br *bytesReader) ([]*DwarfArange, error) {
 				HighPC:          address + length,
 			})
 		}
+		if !terminated {
+			return aranges, fmt.Errorf("address range table at offset 0x%x is not terminated by a null tuple", setStart)
+		}
 	}
 
-	sort.Slice(aranges, func(i, j int) bool {
-		return aranges[i].LowPC < aranges[j].LowPC
-	})
+	sortDwarfAranges(aranges)
 
 	return aranges, nil
+}
+
+func sortDwarfAranges(aranges []*DwarfArange) {
+	sort.SliceStable(aranges, func(i, j int) bool {
+		if aranges[i].SegmentSelector != aranges[j].SegmentSelector {
+			return aranges[i].SegmentSelector < aranges[j].SegmentSelector
+		}
+		if aranges[i].LowPC != aranges[j].LowPC {
+			return aranges[i].LowPC < aranges[j].LowPC
+		}
+		if aranges[i].HighPC != aranges[j].HighPC {
+			return aranges[i].HighPC < aranges[j].HighPC
+		}
+		return aranges[i].CUOffset < aranges[j].CUOffset
+	})
+}
+
+func inferArangesByteOrder(data []byte, setStart int) (binary.ByteOrder, error) {
+	if setStart < 0 || setStart+4 > len(data) {
+		return nil, fmt.Errorf("truncated __debug_aranges initial length at offset 0x%x", setStart)
+	}
+	versionOffset := setStart + 4
+	if data[setStart] == 0xff && data[setStart+1] == 0xff && data[setStart+2] == 0xff && data[setStart+3] == 0xff {
+		versionOffset += 8
+	}
+	if versionOffset+2 > len(data) {
+		return nil, fmt.Errorf("truncated __debug_aranges version at offset 0x%x", setStart)
+	}
+	switch {
+	case data[versionOffset] == 2 && data[versionOffset+1] == 0:
+		return binary.LittleEndian, nil
+	case data[versionOffset] == 0 && data[versionOffset+1] == 2:
+		return binary.BigEndian, nil
+	default:
+		return nil, fmt.Errorf("unable to infer __debug_aranges byte order at offset 0x%x", setStart)
+	}
+}
+
+func supportedArangesUintSize(size int, allowZero bool) bool {
+	if allowZero && size == 0 {
+		return true
+	}
+	return size >= 1 && size <= 8
+}
+
+func readArangesBytes(br *bytesReader, size, setEnd int) ([]byte, error) {
+	if size < 0 || br.Offset() > setEnd || size > setEnd-br.Offset() {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return br.Bytes(size)
+}
+
+func readArangesUint(br *bytesReader, size int, byteOrder binary.ByteOrder, setEnd int) (uint64, error) {
+	if size == 0 {
+		return 0, nil
+	}
+	b, err := readArangesBytes(br, size, setEnd)
+	if err != nil {
+		return 0, err
+	}
+	switch size {
+	case 1:
+		return uint64(b[0]), nil
+	case 2:
+		return uint64(byteOrder.Uint16(b)), nil
+	case 4:
+		return uint64(byteOrder.Uint32(b)), nil
+	case 8:
+		return byteOrder.Uint64(b), nil
+	default:
+		var padded [8]byte
+		var probe [2]byte
+		byteOrder.PutUint16(probe[:], 0x0102)
+		switch probe {
+		case [2]byte{0x02, 0x01}:
+			copy(padded[:], b)
+		case [2]byte{0x01, 0x02}:
+			copy(padded[len(padded)-len(b):], b)
+		default:
+			return 0, fmt.Errorf("unsupported byte order %q", byteOrder.String())
+		}
+		return byteOrder.Uint64(padded[:]), nil
+	}
 }
 
 // GetCUBodyOffset gets the .debug_info CU body offset by the CU header offset
@@ -169,7 +267,7 @@ func GetCUBodyOffset(cuOffset uint64, debugInfoReader *bytesReader) (int, error)
 		return 0, fmt.Errorf("unable to read the CU first 4 bytes: %w", err)
 	}
 	if first4B[0] == 0xff && first4B[1] == 0xff && first4B[2] == 0xff && first4B[3] == 0xff {
-		_, err = r.Skip(8) // 64 bit data length
+		_, err = r.Skip(8) // 64-bit data length
 		if err != nil {
 			return 0, fmt.Errorf("unable to read the CU 8 length bytes: %w", err)
 		}
